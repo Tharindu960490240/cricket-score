@@ -1,0 +1,6 @@
+{
+  "name": "cricket-scorer",
+  "private": true,
+  "version": "3.0.0",
+  "engines": { "node": ">=18" }
+}

@@ -1,0 +1,2105 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#1F3D2E" />
+    <title>Backyard Cricket Scorer</title>
+    <meta name="claude:viewport-fit-sides" content="cover" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;800;900&family=Barlow:wght@400;500;600&display=swap"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="wrap" id="app"></div>
+    <div id="sheet"></div>
+    <script>
+      const LKEY = "cricket-admin-v3",
+        OLDKEY = "cricket-tourney-v2",
+        TKEY = "cricket-token-v1";
+      const qs = new URLSearchParams(location.search);
+      let T = null,
+        H = [],
+        mod = null,
+        sheet = null,
+        view = "setup",
+        D = null,
+        armed = null,
+        mode = "public";
+      let cloud = "checking",
+        token = null,
+        pushTimer = null,
+        pushState = "idle",
+        lastSync = 0,
+        INDEX = null,
+        tvTimer = null;
+      const PUB = {
+        tid: null,
+        updated: -1,
+        tab: "matches",
+        mtab: "com",
+        timer: null,
+      };
+      const $ = (s) => document.querySelector(s);
+      const esc = (t) =>
+        String(t ?? "").replace(
+          /[&<>"']/g,
+          (c) =>
+            ({
+              "&": "&amp;",
+              "<": "&lt;",
+              ">": "&gt;",
+              '"': "&quot;",
+              "'": "&#39;",
+            })[c],
+        );
+      const clamp = (v, a, b, d) => {
+        v = parseInt(v);
+        return isNaN(v) ? d : Math.max(a, Math.min(b, v));
+      };
+      const ov = (b) => Math.floor(b / 6) + "." + (b % 6);
+      const tn = (i) => (T && T.teams[i] ? T.teams[i].name : "?");
+      const M = () => T.matches[T.cur];
+      const plOf = (m, team) => m.players[m.t.indexOf(team)];
+      const maxW = (m, I) => (m.lastMan ? plOf(m, I.bat) : plOf(m, I.bat) - 1);
+      const target = (m) => m.innings[0].runs + 1;
+      const s1 = (n) => (n === 1 ? "" : "s");
+      const hhmm = (t) =>
+        new Date(t).toLocaleTimeString([], {
+          hour: "numeric",
+          minute: "2-digit",
+        });
+      const lget = (k) => {
+        try {
+          return localStorage.getItem(k);
+        } catch (e) {
+          return null;
+        }
+      };
+      const lset = (k, v) => {
+        try {
+          v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v);
+        } catch (e) {}
+      };
+      function rid() {
+        const a = "abcdefghjkmnpqrstuvwxyz23456789";
+        const v = new Uint32Array(8);
+        crypto.getRandomValues(v);
+        return Array.from(v, (x) => a[x % a.length]).join("");
+      }
+      function arm(id) {
+        if (armed === id) {
+          armed = null;
+          return true;
+        }
+        armed = id;
+        setTimeout(() => {
+          if (armed === id) {
+            armed = null;
+            render();
+          }
+        }, 3000);
+        render();
+        return false;
+      }
+      function snap() {
+        H.push(JSON.stringify(M()));
+      }
+      function addSquad(team, name) {
+        const t = T.teams[team];
+        if (!t || !name) return;
+        t.squad = t.squad || [];
+        if (!t.squad.some((x) => x.toLowerCase() === name.toLowerCase()))
+          t.squad.push(name);
+      }
+      function squadList(id, team) {
+        return `<datalist id="${id}">${(T.teams[team].squad || []).map((n) => `<option value="${esc(n)}"></option>`).join("")}</datalist>`;
+      }
+      function copyFrom(btn) {
+        const inp = document.getElementById(btn.dataset.copy);
+        const done = () => {
+          btn.textContent = "Copied";
+          setTimeout(() => (btn.textContent = "Copy"), 1500);
+        };
+        try {
+          navigator.clipboard
+            .writeText(inp.value)
+            .then(done)
+            .catch(() => {
+              inp.focus();
+              inp.select();
+            });
+        } catch (e) {
+          inp.focus();
+          inp.select();
+        }
+      }
+      const origin = () => location.origin;
+
+      /* ================= server ================= */
+      async function api(path, opt = {}) {
+        const r = await fetch("/api/" + path, { cache: "no-store", ...opt });
+        let j = null;
+        try {
+          j = await r.json();
+        } catch (e) {}
+        return { status: r.status, ok: r.ok, j };
+      }
+      async function detect() {
+        try {
+          const ctl = new AbortController();
+          const to = setTimeout(() => ctl.abort(), 5000);
+          const r = await fetch("/api/state", {
+            signal: ctl.signal,
+            cache: "no-store",
+          });
+          clearTimeout(to);
+          if (!(r.headers.get("content-type") || "").includes("json")) {
+            cloud = "off";
+            return;
+          }
+          if (r.status === 503) {
+            cloud = "nostore";
+            return;
+          }
+          if (r.ok) {
+            cloud = "on";
+            INDEX = await r.json();
+          } else cloud = "off";
+        } catch (e) {
+          cloud = "off";
+        }
+      }
+      function saveLocalOnly() {
+        lset(LKEY, JSON.stringify({ T, H: H.slice(-150) }));
+      }
+      function save() {
+        if (T) T.updated = Date.now();
+        saveLocalOnly();
+        schedulePush();
+      }
+      function schedulePush(delay = 500) {
+        if (cloud !== "on" || !token || !T) return;
+        clearTimeout(pushTimer);
+        pushState = "pending";
+        updSync();
+        pushTimer = setTimeout(pushNow, delay);
+      }
+      async function pushNow() {
+        try {
+          const r = await fetch("/api/state", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: "Bearer " + token,
+            },
+            body: JSON.stringify({ t: T.id, data: { T } }),
+          });
+          if (r.status === 401) {
+            token = null;
+            lset(TKEY, null);
+            pushState = "auth";
+          } else if (r.ok) {
+            pushState = "ok";
+            lastSync = Date.now();
+          } else {
+            pushState = "err";
+            schedulePush(5000);
+          }
+        } catch (e) {
+          pushState = "err";
+          schedulePush(5000);
+        }
+        updSync();
+      }
+      function syncText() {
+        if (cloud !== "on") return "Saved on this device";
+        return {
+          ok: "Live · updated " + hhmm(lastSync || Date.now()),
+          pending: "Sending…",
+          err: "No signal. Scores are saved on this phone and will send when you are back online.",
+          auth: "Logged out. Log in again to publish scores.",
+          idle: "Live",
+        }[pushState];
+      }
+      function updSync() {
+        document.querySelectorAll(".syncdot").forEach((el) => {
+          el.textContent = syncText();
+          el.classList.toggle(
+            "bad",
+            pushState === "err" || pushState === "auth",
+          );
+        });
+      }
+      async function flushPush() {
+        if (pushState === "pending" || pushState === "err") {
+          clearTimeout(pushTimer);
+          await pushNow();
+        }
+      }
+
+      /* ================= cricket helpers ================= */
+      const HOW = [
+        ["bowled", "Bowled"],
+        ["caught", "Caught"],
+        ["lbw", "LBW"],
+        ["runout", "Run out"],
+        ["stumped", "Stumped"],
+        ["hitwicket", "Hit wicket"],
+      ];
+      const CREDIT = { bowled: 1, caught: 1, lbw: 1, stumped: 1, hitwicket: 1 };
+      const NEEDS_F = {
+        caught: "Caught by",
+        stumped: "Stumped by (keeper)",
+        runout: "Run out by (optional)",
+      };
+      function howText(b) {
+        if (!b.out) return "not out";
+        const w = b.bw || "",
+          f = b.f || "";
+        switch (b.how) {
+          case "bowled":
+            return "b " + w;
+          case "caught":
+            return f && f.toLowerCase() === w.toLowerCase()
+              ? "c & b " + w
+              : (f ? "c " + f + " " : "c ") + "b " + w;
+          case "lbw":
+            return "lbw b " + w;
+          case "runout":
+            return "run out" + (f ? " (" + f + ")" : "");
+          case "stumped":
+            return "st " + (f ? f + " " : "") + "b " + w;
+          case "hitwicket":
+            return "hit wicket b " + w;
+          default:
+            return "out";
+        }
+      }
+      function ballText(x) {
+        if (!x.bat) return esc(x.l);
+        const who = `${esc(x.bow)} to ${esc(x.bat)}, `;
+        const runs = (r) =>
+          r === 4
+            ? "<b>FOUR</b>"
+            : r === 6
+              ? "<b>SIX</b>"
+              : r === 0
+                ? "no run"
+                : `${r} run${s1(r)}`;
+        switch (x.k) {
+          case "run":
+            return who + runs(x.r);
+          case "wd":
+            return who + "wide" + (x.r ? `, ${x.r + 1} runs` : "");
+          case "nb":
+            return who + "no-ball" + (x.r ? ", " + runs(x.r) : "");
+          case "b":
+            return who + `${x.r} bye${s1(x.r)}`;
+          case "lb":
+            return who + `${x.r} leg bye${s1(x.r)}`;
+          case "w":
+            return (
+              who +
+              `<b>OUT!</b> ${esc(x.out)} ${esc(x.dis)} ${x.os}` +
+              (x.r ? ` · ${x.r} run${s1(x.r)} completed` : "")
+            );
+        }
+        return esc(x.l);
+      }
+      function collect(ms) {
+        const bat = {},
+          bowl = {};
+        ms.forEach((m) =>
+          m.innings.forEach((I) => {
+            I.batters.forEach((b) => {
+              const k = I.bat + "|" + b.name.toLowerCase();
+              const o =
+                bat[k] ||
+                (bat[k] = {
+                  name: b.name,
+                  team: I.bat,
+                  r: 0,
+                  b: 0,
+                  f4: 0,
+                  s6: 0,
+                  inn: 0,
+                  hs: 0,
+                });
+              o.r += b.r;
+              o.b += b.b;
+              o.f4 += b.f4;
+              o.s6 += b.s6;
+              o.inn++;
+              if (b.r > o.hs) o.hs = b.r;
+            });
+            I.bowlers.forEach((w) => {
+              const k = I.bowl + "|" + w.name.toLowerCase();
+              const o =
+                bowl[k] ||
+                (bowl[k] = {
+                  name: w.name,
+                  team: I.bowl,
+                  balls: 0,
+                  r: 0,
+                  w: 0,
+                  bw: -1,
+                  br: 0,
+                });
+              o.balls += w.balls;
+              o.r += w.r;
+              o.w += w.w;
+              if (w.w > o.bw || (w.w === o.bw && w.r < o.br)) {
+                o.bw = w.w;
+                o.br = w.r;
+              }
+            });
+          }),
+        );
+        return {
+          B: Object.values(bat)
+            .filter((x) => x.b || x.r)
+            .sort((a, b) => b.r - a.r || a.b - b.b),
+          W: Object.values(bowl)
+            .filter((x) => x.balls)
+            .sort((a, b) => b.w - a.w || a.r - b.r || a.balls - b.balls),
+        };
+      }
+      const batLine = (x, tour) =>
+        tour
+          ? `${x.r} runs · ${x.inn} inns · best ${x.hs}`
+          : `${x.r} off ${x.b} ball${s1(x.b)}${x.s6 ? " · " + x.s6 + "×6" : ""}`;
+      const bowlLine = (x, tour) =>
+        tour
+          ? `${x.w} wkt${s1(x.w)} · ${x.r} runs · ${ov(x.balls)} ov`
+          : `${x.w}/${x.r} off ${ov(x.balls)} overs`;
+      function awardsHTML(st, tour, champ) {
+        const a = st.B[0],
+          w = st.W[0];
+        return `<div class="awards">
+    ${champ != null ? `<div class="aw champ"><span class="label">Champions</span><b>${esc(tn(champ.i))}</b><span>${champ.pts} points · ${champ.w} win${s1(champ.w)}</span></div>` : ""}
+    ${a ? `<div class="aw"><span class="label">${tour ? "Top run scorer" : "Top scorer"}</span><b>${esc(a.name)}</b><span>${esc(tn(a.team))} · ${batLine(a, tour)}</span></div>` : ""}
+    ${w ? `<div class="aw"><span class="label">Best bowler</span><b>${esc(w.name)}</b><span>${esc(tn(w.team))} · ${bowlLine(w, tour)}</span></div>` : ""}
+  </div>`;
+      }
+      function standings() {
+        const rows = T.teams.map((t, i) => ({
+          i,
+          name: t.name,
+          p: 0,
+          w: 0,
+          l: 0,
+          tie: 0,
+          pts: 0,
+          rf: 0,
+          bf: 0,
+          ra: 0,
+          bb: 0,
+        }));
+        T.matches.forEach((m) => {
+          if (!m.result) return;
+          m.innings.forEach((I) => {
+            const balls = I.wkts >= maxW(m, I) ? m.overs * 6 : I.balls;
+            rows[I.bat].rf += I.runs;
+            rows[I.bat].bf += balls;
+            rows[I.bowl].ra += I.runs;
+            rows[I.bowl].bb += balls;
+          });
+          m.t.forEach((x) => {
+            const r = rows[x];
+            r.p++;
+            if (m.winner === -1) {
+              r.tie++;
+              r.pts += 1;
+            } else if (m.winner === x) {
+              r.w++;
+              r.pts += 2;
+            } else r.l++;
+          });
+        });
+        rows.forEach((r) => {
+          r.nrr = r.bf && r.bb ? (r.rf * 6) / r.bf - (r.ra * 6) / r.bb : 0;
+        });
+        return rows.sort((a, b) => b.pts - a.pts || b.nrr - a.nrr || a.i - b.i);
+      }
+      const nrrTxt = (r) =>
+        r.p ? (r.nrr >= 0 ? "+" : "") + r.nrr.toFixed(2) : "–";
+      const sr = (r, b) => (b ? ((r * 100) / b).toFixed(0) : "–");
+      const econ = (r, b) => (b ? ((r * 6) / b).toFixed(1) : "–");
+      const chips = (o) =>
+        o.balls
+          .map((x) => `<span class="chip ${x.c}">${esc(x.l)}</span>`)
+          .join("");
+      function tableHTML() {
+        const st = standings();
+        return `<div class="tw"><table class="ptable"><tr><th>Team</th><th>P</th><th>W</th><th>L</th><th>T</th><th>Pts</th><th>NRR</th></tr>
+  ${st.map((r, k) => `<tr class="${k === 0 && r.pts > 0 ? "lead" : ""}"><td>${esc(r.name)}</td><td>${r.p}</td><td>${r.w}</td><td>${r.l}</td><td>${r.tie}</td><td><b>${r.pts}</b></td><td>${nrrTxt(r)}</td></tr>`).join("")}
+  </table></div><p class="note">2 points for a win, 1 for a tie. Net run rate separates teams level on points.</p>`;
+      }
+      function leadersHTML(n) {
+        const tour = collect(T.matches);
+        if (!tour.B.length)
+          return '<p class="note">Stats appear once the first ball is bowled.</p>';
+        return `<div class="tw"><table class="ptable"><tr><th>Batter</th><th>Inns</th><th>Runs</th><th>Best</th><th>SR</th></tr>
+  ${tour.B.slice(0, n)
+    .map(
+      (x) =>
+        `<tr><td>${esc(x.name)}<span class="how">${esc(tn(x.team))}</span></td><td>${x.inn}</td><td><b>${x.r}</b></td><td>${x.hs}</td><td>${sr(x.r, x.b)}</td></tr>`,
+    )
+    .join("")}</table></div>
+  ${
+    tour.W.length
+      ? `<div class="tw"><table class="ptable"><tr><th>Bowler</th><th>O</th><th>R</th><th>W</th><th>Best</th></tr>
+  ${tour.W.slice(0, n)
+    .map(
+      (x) =>
+        `<tr><td>${esc(x.name)}<span class="how">${esc(tn(x.team))}</span></td><td>${ov(x.balls)}</td><td>${x.r}</td><td><b>${x.w}</b></td><td>${x.bw}/${x.br}</td></tr>`,
+    )
+    .join("")}</table></div>`
+      : ""
+  }`;
+      }
+      function matchStatus(m) {
+        if (m.result) return { t: m.result, live: false };
+        const I = m.innings[m.cur];
+        if (m.cur === 0 && !I.batters.length)
+          return { t: `${tn(I.bat)} to bat first`, live: true };
+        if (I.ended && m.cur === 0)
+          return {
+            t: `Innings break · ${tn(I.bowl)} need ${target(m)} to win`,
+            live: true,
+          };
+        if (m.cur === 1) {
+          const need = target(m) - I.runs,
+            left = m.overs * 6 - I.balls;
+          return {
+            t: `${tn(I.bat)} need ${need} off ${left} ball${s1(left)}`,
+            live: true,
+          };
+        }
+        return {
+          t: `${tn(I.bat)} batting · run rate ${I.balls ? ((I.runs * 6) / I.balls).toFixed(2) : "0.00"}`,
+          live: true,
+        };
+      }
+      function cardHTML(m, I, open) {
+        const ex = I.extras,
+          exT = ex.wd + ex.nb + ex.b + ex.lb;
+        const dnb = (T.teams[I.bat].squad || []).length ? "" : "";
+        return `<details class="card" ${open ? "open" : ""}><summary>${esc(tn(I.bat))} · ${I.runs}/${I.wkts} (${ov(I.balls)})</summary><div class="cardsec">
+   <div class="tw"><table class="ptable"><tr><th>Batter</th><th>R</th><th>B</th><th>4s</th><th>6s</th><th>SR</th></tr>
+   ${I.batters.map((b) => `<tr><td>${esc(b.name)}<span class="how">${esc(howText(b))}</span></td><td><b>${b.r}</b></td><td>${b.b}</td><td>${b.f4}</td><td>${b.s6}</td><td>${sr(b.r, b.b)}</td></tr>`).join("")}</table></div>
+   <p class="note">Extras ${exT} (wd ${ex.wd}, nb ${ex.nb}, b ${ex.b}, lb ${ex.lb}) · Total ${I.runs}/${I.wkts} in ${ov(I.balls)} overs${dnb}</p>
+   <div class="tw"><table class="ptable"><tr><th>Bowler</th><th>O</th><th>R</th><th>W</th><th>Econ</th></tr>
+   ${I.bowlers.map((b) => `<tr><td>${esc(b.name)}</td><td>${ov(b.balls)}</td><td>${b.r}</td><td><b>${b.w}</b></td><td>${econ(b.r, b.balls)}</td></tr>`).join("")}</table></div>
+  </div></details>`;
+      }
+      function innSel(m) {
+        return PUB.inn != null && m.innings[PUB.inn] ? PUB.inn : m.cur;
+      }
+      function innPicker(m) {
+        const sel = innSel(m);
+        return `<div class="seg" role="tablist" aria-label="Innings">${m.t
+          .map((team) => {
+            const i = m.innings.findIndex((I) => I.bat === team),
+              I = m.innings[i];
+            return `<button type="button" role="tab" data-inn="${i}" aria-pressed="${i === sel}" ${i < 0 ? "disabled" : ""}>${esc(tn(team))}<br><small>${I ? `${I.runs}/${I.wkts} (${ov(I.balls)})` : "Yet to bat"}</small></button>`;
+          })
+          .join("")}</div>`;
+      }
+      function bindInn(after) {
+        document.querySelectorAll("[data-inn]").forEach(
+          (b) =>
+            (b.onclick = () => {
+              PUB.inn = +b.dataset.inn;
+              after();
+            }),
+        );
+      }
+      function commentaryHTML(m, i) {
+        const I = m.innings[i];
+        if (!I || !I.overs.length || !I.overs.some((o) => o.balls.length))
+          return `<p class="note">${I ? esc(tn(I.bat)) + " innings has not started yet." : "Ball-by-ball commentary starts with the first ball."}</p>`;
+        return `<div class="com">
+    ${I.overs
+      .map((o, oi) => ({ o, oi }))
+      .reverse()
+      .map(
+        ({ o, oi }) => `
+      ${o.end ? `<div class="ovend"><strong>End of over ${oi + 1}</strong><span>${o.end.runs} run${s1(o.end.runs)}</span><span>${esc(tn(I.bat))} ${o.end.score}</span>${o.end.bats.map((b) => `<span>${esc(b)}</span>`).join("")}<span>${esc(o.end.bowl)}</span></div>` : ""}
+      ${[...o.balls]
+        .reverse()
+        .map(
+          (x) =>
+            `<div class="cb ${x.k === "w" ? "wk" : ""}"><span class="bn">${esc(x.n || oi + ".")}</span><span class="chip ${x.c}">${esc(x.l)}</span><span class="tx">${ballText(x)}</span></div>`,
+        )
+        .join("")}
+    `,
+      )
+      .join("")}</div>`;
+      }
+
+      /* ================= tournament setup (admin) ================= */
+      function openSetup(fresh) {
+        const base = T && !fresh ? T : null;
+        D = base
+          ? {
+              name: base.name,
+              overs: base.overs,
+              lastMan: base.lastMan,
+              teams: base.teams.map((t) => ({ ...t })),
+              edit: true,
+            }
+          : {
+              name: T ? T.name + " 2" : "Weekend Cup",
+              overs: T ? T.overs : 6,
+              lastMan: T ? T.lastMan : false,
+              teams: T
+                ? T.teams.map((t) => ({
+                    name: t.name,
+                    players: t.players,
+                    squad: [...(t.squad || [])],
+                  }))
+                : [
+                    { name: "Tigers", players: 6, squad: [] },
+                    { name: "Lions", players: 5, squad: [] },
+                    { name: "Eagles", players: 6, squad: [] },
+                  ],
+              edit: false,
+            };
+        view = "setup";
+        sheet = null;
+        render();
+      }
+      function readSetup() {
+        D.name = $("#sn").value.trim() || "Cricket Cup";
+        D.overs = clamp($("#so").value, 1, 50, 6);
+        D.teams.forEach((t, i) => {
+          t.name = $("#tn" + i).value.trim() || "Team " + (i + 1);
+          t.players = clamp($("#tp" + i).value, 2, 15, 6);
+        });
+      }
+      function renderSetup() {
+        $("#app").className = "wrap";
+        const used = new Set();
+        (D.edit ? T.matches : []).forEach((m) =>
+          m.t.forEach((x) => used.add(x)),
+        );
+        $("#app").innerHTML = `
+  <div class="topbar"><span class="label">${D.edit ? "Edit tournament" : "New tournament"}</span>${T ? '<button class="link" id="cancel">Cancel</button>' : ""}</div>
+  <h1>${D.edit ? "Teams and rules" : "Set up a tournament"}</h1>
+  <div class="panel">
+    <label class="field"><span class="label">Tournament name</span><input id="sn" value="${esc(D.name)}"></label>
+    <label class="field"><span class="label">Overs per innings (same for every match)</span><input id="so" type="number" inputmode="numeric" min="1" max="50" value="${D.overs}"></label>
+    <div class="field"><span class="label">Last man stands</span>
+      <div class="seg"><button id="lmY" aria-pressed="${D.lastMan}">Yes, can bat alone</button><button id="lmN" aria-pressed="${!D.lastMan}">No, all out at last pair</button></div>
+      <p class="note">${D.lastMan ? "When one batter is left, they keep batting alone. A team is all out only when every player is out." : "The innings ends when only one batter is left, as in normal cricket."} You can change this for any single match too.</p>
+    </div>
+  </div>
+  <div class="panel">
+    <h2>Teams</h2>
+    <p class="note">Each team can have a different number of players. Player names are remembered as you score.</p>
+    ${D.teams
+      .map(
+        (t, i) => `<div class="trow">
+      <label class="field"><span class="label">Team ${i + 1}</span><input id="tn${i}" value="${esc(t.name)}"></label>
+      <label class="field"><span class="label">Players</span><input id="tp${i}" type="number" inputmode="numeric" min="2" max="15" value="${t.players}"></label>
+      <button class="x" data-del="${i}" aria-label="Remove ${esc(t.name)}" ${D.teams.length <= 2 || used.has(i) ? "disabled" : ""}>×</button></div>`,
+      )
+      .join("")}
+    <button class="btn ghost sm" id="addT">Add team</button>
+  </div>
+  ${!D.edit && T && cloud !== "on" ? '<p class="hint">Creating a new tournament replaces the current one on this device. Copy a backup first if you want to keep it.</p>' : ""}
+  <button class="btn" id="saveT">${D.edit ? "Save changes" : "Create tournament"}</button>
+  ${T ? "" : `<details class="panel plain"><summary>Restore from a backup</summary>${restoreHTML()}</details>`}`;
+        $("#lmY").onclick = () => {
+          readSetup();
+          D.lastMan = true;
+          render();
+        };
+        $("#lmN").onclick = () => {
+          readSetup();
+          D.lastMan = false;
+          render();
+        };
+        $("#addT").onclick = () => {
+          readSetup();
+          D.teams.push({
+            name: "Team " + (D.teams.length + 1),
+            players: 6,
+            squad: [],
+          });
+          render();
+        };
+        document.querySelectorAll("[data-del]").forEach(
+          (b) =>
+            (b.onclick = () => {
+              readSetup();
+              D.teams.splice(+b.dataset.del, 1);
+              render();
+            }),
+        );
+        $("#cancel") &&
+          ($("#cancel").onclick = () => {
+            view = "home";
+            render();
+          });
+        $("#saveT").onclick = async () => {
+          readSetup();
+          if (D.edit) {
+            T.name = D.name;
+            T.overs = D.overs;
+            T.lastMan = D.lastMan;
+            T.teams = D.teams;
+          } else {
+            if (T) await flushPush();
+            T = {
+              id: rid(),
+              created: Date.now(),
+              name: D.name,
+              overs: D.overs,
+              lastMan: D.lastMan,
+              teams: D.teams,
+              matches: [],
+              cur: null,
+              finished: false,
+            };
+            H = [];
+          }
+          view = "home";
+          save();
+          render();
+        };
+        bindRestore();
+      }
+      function restoreHTML() {
+        return `<p class="note">Paste a backup you copied earlier.</p>
+  <textarea id="rb" aria-label="Backup text"></textarea><button class="btn ghost sm" id="rbgo">Restore backup</button><p class="hint" id="rbmsg"></p>`;
+      }
+      function bindRestore() {
+        const b = $("#rbgo");
+        if (!b) return;
+        b.onclick = () => {
+          try {
+            const d = JSON.parse($("#rb").value);
+            const t = d.T || d;
+            if (!t.teams || !t.matches) throw 0;
+            T = t;
+            T.id = T.id || rid();
+            T.teams.forEach((x) => (x.squad = x.squad || []));
+            H = [];
+            view = T.cur != null ? "match" : "home";
+            save();
+            render();
+          } catch (e) {
+            $("#rbmsg").textContent =
+              "That text is not a scorer backup. Copy it again with Copy backup.";
+          }
+        };
+      }
+
+      /* ================= admin home ================= */
+      function sharePanel() {
+        if (cloud === "on") {
+          const pl = `${origin()}/?t=${T.id}`,
+            tl = `${origin()}/tv?t=${T.id}`;
+          return `<div class="panel"><h2>Share live scores</h2>
+      <p class="note">Anyone with these links can follow every ball. Only you can score.</p>
+      <label class="field"><span class="label">Live scores page</span><div class="copyrow"><input readonly id="pl" value="${esc(pl)}"><button class="btn sm" data-copy="pl">Copy</button></div></label>
+      <label class="field"><span class="label">Big screen (TV or laptop)</span><div class="copyrow"><input readonly id="tl" value="${esc(tl)}"><button class="btn sm" data-copy="tl">Copy</button></div></label>
+      <span class="syncdot">${syncText()}</span>
+      <a class="link" href="${esc(pl)}" target="_blank" rel="noopener">Open the live scores page</a></div>`;
+        }
+        return `<div class="panel"><h2>Live scores</h2>
+    <p class="note">${cloud === "nostore" ? "The online database is not connected yet, so these pages only work on this device. " : "Here these pages only work on this device. Once it is on Vercel, anyone with the link can watch. "}</p>
+    <div class="grid2"><button class="btn ghost sm" id="goLive">Live scores page</button><button class="btn ghost sm" id="goTv">Big screen</button></div></div>`;
+      }
+      function renderHome() {
+        $("#app").className = "wrap wide";
+        const live = T.matches.findIndex((m) => !m.result);
+        const line = (I) =>
+          I ? `${esc(tn(I.bat))} ${I.runs}/${I.wkts} (${ov(I.balls)})` : "";
+        const others = ((INDEX && INDEX.index) || []).filter(
+          (x) => x.id !== T.id,
+        );
+        $("#app").innerHTML = `
+  <div class="topbar"><span class="label">Organiser · ${T.overs} overs · last man ${T.lastMan ? "can bat alone" : "off"}</span>
+    <span style="display:flex;gap:14px"><button class="link" id="edit">Teams &amp; rules</button>${cloud === "on" ? '<button class="link" id="logout">Log out</button>' : ""}</span></div>
+  <h1>${esc(T.name)}</h1>
+  <div class="cols"><div class="col">
+    ${T.finished ? `<div class="panel"><span class="label">Final</span>${awardsHTML(collect(T.matches), true, standings()[0])}</div>` : ""}
+    ${live >= 0 ? `<button class="btn" data-open="${live}">Resume match ${live + 1}</button>` : ""}
+    ${T.finished ? "" : `<button class="btn ${live >= 0 ? "ghost" : ""}" id="newM">New match</button>`}
+    <div class="panel"><h2>Points table</h2>${tableHTML()}</div>
+    <div class="panel"><h2>Tournament leaders</h2>${leadersHTML(5)}</div>
+    ${T.matches.some((m) => m.result) ? `<button class="btn ${T.finished ? "ghost" : ""}" id="fin">${T.finished ? "Reopen tournament" : armed === "fin" ? "Tap again to finish" : "Finish tournament and crown winners"}</button>` : ""}
+  </div><div class="col">
+    ${sharePanel()}
+    <div class="fx"><span class="label">Matches</span>
+      ${
+        T.matches.length
+          ? T.matches
+              .map((m, i) => {
+                const ms = m.result ? collect([m]) : null;
+                return `<button class="fxi" data-open="${i}">
+        <span class="row"><b>Match ${i + 1} · ${esc(tn(m.t[0]))} v ${esc(tn(m.t[1]))}</b>${m.result ? "" : '<span class="tag live">Live</span>'}</span>
+        <span class="sc">${line(m.innings[0])}${m.innings[1] ? " · " + line(m.innings[1]) : ""}</span>
+        ${m.result ? `<span class="res">${esc(m.result)}</span>` : ""}
+        ${ms && ms.B[0] ? `<span class="stars">Top scorer ${esc(ms.B[0].name)} ${ms.B[0].r}${ms.W[0] ? ` · Best bowler ${esc(ms.W[0].name)} ${ms.W[0].w}/${ms.W[0].r}` : ""}</span>` : ""}
+        </button>`;
+              })
+              .reverse()
+              .join("")
+          : '<p class="note">No matches yet. Tap New match to start the first one.</p>'
+      }
+    </div>
+    <div class="panel"><h2>Tournaments</h2>
+      ${others.length ? `<div class="fx">${others.map((x) => `<button class="fxi" data-tour="${esc(x.id)}"><span class="row"><b>${esc(x.name)}</b><span class="note">Open</span></span></button>`).join("")}</div>` : ""}
+      <p class="note">${cloud === "on" ? "Old tournaments stay on the live scores site until you delete them." : "Scores stay saved on this device until you delete them."}</p>
+      <button class="btn ghost sm" id="newT">New tournament</button>
+      <details class="plain"><summary>Backup</summary><div style="display:flex;flex-direction:column;gap:10px;margin-top:10px">
+        <button class="btn ghost sm" id="bkgo">Copy backup</button>${restoreHTML()}</div></details>
+      <button class="link danger" id="wipe" style="align-self:flex-start">${armed === "wipe" ? "Tap again to delete this tournament" : "Delete this tournament"}</button>
+    </div>
+  </div></div>`;
+        $("#edit").onclick = () => openSetup(false);
+        $("#newT").onclick = () => openSetup(true);
+        $("#logout") &&
+          ($("#logout").onclick = async () => {
+            await flushPush();
+            token = null;
+            lset(TKEY, null);
+            renderLogin();
+          });
+        $("#newM") &&
+          ($("#newM").onclick = () => {
+            sheet = { k: "newmatch" };
+            render();
+          });
+        $("#fin") &&
+          ($("#fin").onclick = () => {
+            if (T.finished) {
+              T.finished = false;
+              save();
+              render();
+            } else if (arm("fin")) {
+              T.finished = true;
+              save();
+              render();
+              scrollTo(0, 0);
+            }
+          });
+        document.querySelectorAll("[data-open]").forEach(
+          (b) =>
+            (b.onclick = () => {
+              const i = +b.dataset.open;
+              PUB.inn = null;
+              if (T.cur !== i) H = [];
+              T.cur = i;
+              view = "match";
+              mod = null;
+              save();
+              render();
+              scrollTo(0, 0);
+            }),
+        );
+        document
+          .querySelectorAll("[data-copy]")
+          .forEach((b) => (b.onclick = () => copyFrom(b)));
+        document.querySelectorAll("[data-tour]").forEach(
+          (b) =>
+            (b.onclick = async () => {
+              await flushPush();
+              const s = await api(
+                "state?t=" + b.dataset.tour + "&fresh=" + Date.now(),
+              );
+              if (s.ok && s.j.data) {
+                T = s.j.data.T;
+                T.id = b.dataset.tour;
+                H = [];
+                view = "home";
+                saveLocalOnly();
+                render();
+              }
+            }),
+        );
+        $("#goLive") &&
+          ($("#goLive").onclick = () => {
+            location.hash = "live";
+          });
+        $("#goTv") &&
+          ($("#goTv").onclick = () => {
+            location.hash = "tv";
+          });
+        $("#bkgo").onclick = (e) => {
+          const btn = e.currentTarget;
+          const txt = JSON.stringify({ T });
+          try {
+            navigator.clipboard
+              .writeText(txt)
+              .then(() => {
+                btn.textContent = "Backup copied";
+              })
+              .catch(() => {
+                $("#rb").value = txt;
+                $("#rb").select();
+                btn.textContent = "Select and copy the text below";
+              });
+          } catch (err) {
+            $("#rb").value = txt;
+            $("#rb").select();
+          }
+        };
+        bindRestore();
+        $("#wipe").onclick = async () => {
+          if (!arm("wipe")) return;
+          if (cloud === "on" && token) {
+            clearTimeout(pushTimer);
+            await api("state?t=" + T.id, {
+              method: "DELETE",
+              headers: { Authorization: "Bearer " + token },
+            });
+            const r = await api("state?fresh=" + Date.now());
+            INDEX = r.j;
+          }
+          T = null;
+          H = [];
+          lset(LKEY, null);
+          if (cloud === "on" && INDEX && INDEX.latest) {
+            const s = await api(
+              "state?t=" + INDEX.latest + "&fresh=" + Date.now(),
+            );
+            if (s.ok) {
+              T = s.j.data.T;
+              T.id = INDEX.latest;
+              saveLocalOnly();
+              view = "home";
+              return render();
+            }
+          }
+          D = null;
+          openSetup(true);
+        };
+      }
+
+      /* ================= match engine ================= */
+      function newInn(bat, bowl) {
+        return {
+          bat,
+          bowl,
+          runs: 0,
+          wkts: 0,
+          balls: 0,
+          extras: { wd: 0, nb: 0, b: 0, lb: 0 },
+          batters: [],
+          striker: -1,
+          non: -1,
+          bowlers: [],
+          bowler: -1,
+          overs: [],
+          needs: ["openers"],
+          ended: false,
+        };
+      }
+      const okB = (I, i) => i >= 0 && I.batters[i] && !I.batters[i].out;
+      function fixCrease(m, I) {
+        const left = plOf(m, I.bat) - I.wkts,
+          want = Math.max(0, Math.min(2, left));
+        let s = okB(I, I.striker),
+          n = okB(I, I.non);
+        if (want === 1) {
+          if (!s && n) {
+            I.striker = I.non;
+            I.non = -1;
+          } else if (s && !n) {
+            I.non = -1;
+          }
+          s = okB(I, I.striker);
+          n = okB(I, I.non);
+        }
+        const at = (s ? 1 : 0) + (n ? 1 : 0);
+        I.needs = I.needs.filter((x) => x !== "batter");
+        for (let k = 0; k < Math.max(0, want - at); k++)
+          I.needs.unshift("batter");
+      }
+      function isDone(m, I) {
+        return (
+          I.wkts >= maxW(m, I) ||
+          I.balls >= m.overs * 6 ||
+          (m.cur === 1 && I.runs >= target(m))
+        );
+      }
+      function finish(m) {
+        const I = m.innings[m.cur];
+        I.ended = true;
+        I.needs = [];
+        if (m.cur === 1) {
+          const a = m.innings[0],
+            b = m.innings[1];
+          if (b.runs >= target(m)) {
+            const w = maxW(m, b) - b.wkts;
+            m.winner = b.bat;
+            m.result = `${tn(b.bat)} won by ${w} wicket${s1(w)}`;
+          } else if (b.runs === a.runs) {
+            m.winner = -1;
+            m.result = "Match tied";
+          } else {
+            const r = a.runs - b.runs;
+            m.winner = a.bat;
+            m.result = `${tn(a.bat)} won by ${r} run${s1(r)}`;
+          }
+        }
+      }
+      function overSummary(I) {
+        const o = I.overs[I.overs.length - 1],
+          bw = I.bowlers[I.bowler];
+        const bats = [I.striker, I.non]
+          .filter((i) => okB(I, i))
+          .map((i) => {
+            const b = I.batters[i];
+            return `${b.name} ${b.r} (${b.b})`;
+          });
+        o.end = {
+          runs: o.balls.reduce((s, x) => s + (x.t || 0), 0),
+          score: `${I.runs}/${I.wkts}`,
+          bats,
+          bowl: `${bw.name} ${bw.w}/${bw.r} (${ov(bw.balls)})`,
+        };
+      }
+      function afterBall(m, I, legal) {
+        if (legal && I.balls % 6 === 0) overSummary(I);
+        if (isDone(m, I)) {
+          finish(m);
+          return;
+        }
+        if (legal && I.balls % 6 === 0) {
+          if (I.non >= 0) [I.striker, I.non] = [I.non, I.striker];
+          fixCrease(m, I);
+          I.needs.push("bowler");
+        } else fixCrease(m, I);
+      }
+      function record(kind, runs) {
+        const m = M(),
+          I = m.innings[m.cur];
+        if (I.needs.length || I.ended || m.result) return;
+        snap();
+        const bat = I.batters[I.striker],
+          bw = I.bowlers[I.bowler],
+          over = I.overs[I.overs.length - 1];
+        const n = `${I.overs.length - 1}.${(over.legal || 0) + 1}`;
+        let total = runs,
+          legal = true,
+          label,
+          cls = "";
+        if (kind === "wd") {
+          legal = false;
+          total = 1 + runs;
+          I.extras.wd += total;
+          bw.r += total;
+          label = (runs ? runs + 1 : "") + "wd";
+          cls = "cx";
+        } else if (kind === "nb") {
+          legal = false;
+          total = 1 + runs;
+          I.extras.nb += 1;
+          bat.r += runs;
+          bat.b++;
+          if (runs === 4) bat.f4++;
+          if (runs === 6) bat.s6++;
+          bw.r += total;
+          label = "nb" + (runs ? "+" + runs : "");
+          cls = "cx";
+        } else if (kind === "b" || kind === "lb") {
+          I.extras[kind] += runs;
+          bat.b++;
+          bw.balls++;
+          label = runs + kind;
+          cls = "cx";
+        } else {
+          bat.r += runs;
+          bat.b++;
+          if (runs === 4) bat.f4++;
+          if (runs === 6) bat.s6++;
+          bw.r += runs;
+          bw.balls++;
+          label = String(runs);
+          cls = runs === 4 ? "c4" : runs === 6 ? "c6" : runs === 0 ? "dot" : "";
+        }
+        I.runs += total;
+        over.balls.push({
+          l: label,
+          c: cls,
+          n,
+          k: kind,
+          r: runs,
+          t: total,
+          bat: bat.name,
+          bow: bw.name,
+        });
+        if (legal) {
+          I.balls++;
+          over.legal = (over.legal || 0) + 1;
+        }
+        if (runs % 2 === 1 && I.non >= 0)
+          [I.striker, I.non] = [I.non, I.striker];
+        afterBall(m, I, legal);
+        mod = null;
+        save();
+        render();
+      }
+      function wicket(how, who, f, runs) {
+        const m = M(),
+          I = m.innings[m.cur];
+        snap();
+        runs = runs || 0;
+        const st = I.batters[I.striker],
+          bw = I.bowlers[I.bowler],
+          over = I.overs[I.overs.length - 1];
+        const n = `${I.overs.length - 1}.${(over.legal || 0) + 1}`;
+        const out = I.batters[who === "non" ? I.non : I.striker];
+        if (runs) {
+          st.r += runs;
+          bw.r += runs;
+          I.runs += runs;
+        }
+        out.out = true;
+        out.how = how;
+        out.f = f || "";
+        out.bw = bw.name;
+        st.b++;
+        if (CREDIT[how]) bw.w++;
+        bw.balls++;
+        I.balls++;
+        I.wkts++;
+        over.legal = (over.legal || 0) + 1;
+        over.balls.push({
+          l: (runs ? runs + "+" : "") + (how === "runout" ? "RO" : "W"),
+          c: "cw",
+          n,
+          k: "w",
+          r: runs,
+          t: runs,
+          bat: st.name,
+          bow: bw.name,
+          out: out.name,
+          dis: howText(out),
+          os: `${out.r} (${out.b})`,
+        });
+        if (runs % 2 === 1 && I.non >= 0)
+          [I.striker, I.non] = [I.non, I.striker];
+        if (f) addSquad(I.bowl, f);
+        sheet = null;
+        afterBall(m, I, true);
+        save();
+        render();
+      }
+      function startSecond() {
+        PUB.inn = null;
+        const m = M();
+        snap();
+        const a = m.innings[0];
+        m.innings.push(newInn(a.bowl, a.bat));
+        m.cur = 1;
+        save();
+        render();
+      }
+      function undo() {
+        if (!H.length) return;
+        T.matches[T.cur] = JSON.parse(H.pop());
+        mod = null;
+        sheet = null;
+        save();
+        render();
+      }
+      function addBatter(I, name) {
+        I.batters.push({ name, r: 0, b: 0, f4: 0, s6: 0, out: false });
+        addSquad(I.bat, name);
+        return I.batters.length - 1;
+      }
+      function setBowler(I, name) {
+        let i = I.bowlers.findIndex(
+          (x) => x.name.toLowerCase() === name.toLowerCase(),
+        );
+        if (i < 0) {
+          I.bowlers.push({ name, balls: 0, r: 0, w: 0 });
+          i = I.bowlers.length - 1;
+        }
+        I.bowler = i;
+        I.overs.push({ bowler: name, balls: [], legal: 0 });
+        addSquad(I.bowl, name);
+      }
+      function reeval(m) {
+        const I = m.innings[m.cur],
+          done = isDone(m, I);
+        if (done && !I.ended) {
+          finish(m);
+          return;
+        }
+        if (!done && I.ended) {
+          I.ended = false;
+          m.result = null;
+          m.winner = null;
+          fixCrease(m, I);
+          const lo = I.overs[I.overs.length - 1];
+          if (I.balls > 0 && I.balls % 6 === 0 && lo && lo.legal >= 6)
+            I.needs.push("bowler");
+          return;
+        }
+        if (!done && !I.needs.includes("openers")) fixCrease(m, I);
+      }
+      function nextName(team, used) {
+        const sq = T.teams[team].squad || [];
+        const taken = new Set(used.map((x) => x.toLowerCase()));
+        return sq.find((n) => !taken.has(n.toLowerCase()));
+      }
+
+      /* ================= admin match view ================= */
+      function renderMatch() {
+        $("#app").className = "wrap wide";
+        const m = M(),
+          I = m.innings[m.cur],
+          a = m.innings[0];
+        const crr = I.balls ? ((I.runs * 6) / I.balls).toFixed(2) : "0.00";
+        let chase = "";
+        if (m.cur === 1 && !m.result) {
+          const need = target(m) - I.runs,
+            left = m.overs * 6 - I.balls;
+          chase = `<div class="chase">Need ${need} off ${left} ball${s1(left)} · RRR ${left ? ((need * 6) / left).toFixed(2) : "–"}</div>`;
+        }
+        const batRow = (i) => {
+          const b = I.batters[i];
+          return b
+            ? `<tr><td class="${i === I.striker ? "strike" : ""}">${esc(b.name)}</td><td><b>${b.r}</b></td><td>${b.b}</td><td>${b.f4}</td><td>${b.s6}</td><td>${sr(b.r, b.b)}</td></tr>`
+            : "";
+        };
+        const bw = I.bowlers[I.bowler],
+          cur = I.overs[I.overs.length - 1];
+        const locked = I.needs.length || I.ended || m.result;
+        const alone =
+          !I.ended && I.batters.length && I.non === -1 && okB(I, I.striker);
+        const hints = {
+          wd: "Wide: tap runs taken (0 if none). 1 extra is added.",
+          nb: "No-ball: tap runs off the bat. 1 extra is added.",
+          b: "Byes: tap how many they ran.",
+          lb: "Leg byes: tap how many they ran.",
+        };
+        let endBlock = "";
+        if (m.result) {
+          const b = m.innings[1];
+          endBlock = `<div class="panel"><span class="label">Result</span><div class="result">${esc(m.result)}</div>
+      <p class="note">${esc(tn(a.bat))} ${a.runs}/${a.wkts} (${ov(a.balls)}) · ${esc(tn(b.bat))} ${b.runs}/${b.wkts} (${ov(b.balls)})</p>
+      ${awardsHTML(collect([m]), false)}
+      <button class="btn" id="home2">Back to points table</button></div>`;
+        } else if (I.ended && m.cur === 0) {
+          endBlock = `<div class="panel"><span class="label">Innings break</span>
+      <div class="result">${esc(tn(I.bowl))} need ${target(m)} to win</div>
+      <p class="note">${m.overs} overs, ${plOf(m, I.bowl)} players${m.lastMan ? ", last man can bat alone" : ""}.</p>
+      <button class="btn" id="second">Start ${esc(tn(I.bowl))} innings</button></div>`;
+        }
+        $("#app").innerHTML = `
+  <div class="topbar"><button class="link" id="back">← ${esc(T.name)}</button><span class="syncdot">${syncText()}</span><button class="link" id="cfg">Overs &amp; players</button></div>
+  <div class="cols"><div class="col stick">
+  <div class="board">
+    <div class="top"><span class="team">${esc(tn(I.bat))}</span><span class="label" style="color:inherit;opacity:.75">Match ${T.cur + 1} · ${m.cur === 0 ? "1st" : "2nd"} inns</span></div>
+    <div class="score">${I.runs}/${I.wkts}<small>${ov(I.balls)}</small></div>
+    <div class="stats"><span>CRR <b>${crr}</b></span><span>Overs <b>${m.overs}</b></span><span>Players <b>${plOf(m, I.bat)}</b></span><span>All out at <b>${maxW(m, I)}</b></span>${m.cur === 1 ? `<span>Target <b>${target(m)}</b></span>` : ""}</div>
+    ${chase}
+  </div>
+  ${endBlock}
+  ${
+    !I.ended && I.batters.length
+      ? `<div class="panel">
+    ${alone ? '<span><span class="tag alone">Last man batting alone</span></span>' : ""}
+    <div class="tw"><table class="ptable"><tr><th>Batter</th><th>R</th><th>B</th><th>4s</th><th>6s</th><th>SR</th></tr>${batRow(I.striker)}${batRow(I.non)}</table></div>
+    ${
+      bw
+        ? `<div class="tw"><table class="ptable"><tr><th>Bowler</th><th>O</th><th>R</th><th>W</th><th>Econ</th></tr>
+      <tr><td>${esc(bw.name)}</td><td>${ov(bw.balls)}</td><td>${bw.r}</td><td><b>${bw.w}</b></td><td>${econ(bw.r, bw.balls)}</td></tr></table></div>`
+        : ""
+    }
+  </div>`
+      : ""
+  }
+  ${
+    !I.ended
+      ? `<div><span class="label">This over</span><div class="over">${cur ? chips(cur) : ""}${!cur || !cur.balls.length ? '<span class="note">No balls yet</span>' : ""}</div></div>
+  <p class="hint">${mod ? hints[mod] : ""}</p>
+  <div class="pad">
+    ${[0, 1, 2, 3, 4, 6, 5].map((r) => `<button class="k" data-r="${r}" ${locked ? "disabled" : ""}>${r}</button>`).join("")}
+    ${["wd", "nb", "b", "lb"].map((x) => `<button class="k m" data-m="${x}" aria-pressed="${mod === x}" ${locked ? "disabled" : ""}>${{ wd: "Wd", nb: "Nb", b: "Bye", lb: "LB" }[x]}</button>`).join("")}
+    <button class="k w" id="wk" ${locked || mod ? "disabled" : ""}>Wicket</button>
+    <button class="k u" id="undo" ${H.length ? "" : "disabled"}>Undo</button>
+  </div>`
+      : `<button class="btn ghost" id="undo" ${H.length ? "" : "disabled"}>Undo last ball</button>`
+  }
+  </div><div class="col">
+  <span class="label">Scorecard</span>${m.innings.map((x) => cardHTML(m, x, !m.result)).join("")}
+  <details class="card" id="bbb" ${PUB.bbbOpen ? "open" : ""}><summary>Ball by ball</summary><div class="cardsec">${innPicker(m)}${commentaryHTML(m, innSel(m))}</div></details>
+  <button class="link danger" id="del" style="align-self:center">${armed === "del" ? "Tap again to delete this match" : "Delete this match"}</button>
+  </div></div>`;
+        document
+          .querySelectorAll("[data-r]")
+          .forEach(
+            (b) => (b.onclick = () => record(mod || "run", +b.dataset.r)),
+          );
+        document.querySelectorAll("[data-m]").forEach(
+          (b) =>
+            (b.onclick = () => {
+              mod = mod === b.dataset.m ? null : b.dataset.m;
+              render();
+            }),
+        );
+        $("#wk") &&
+          ($("#wk").onclick = () => {
+            sheet = { k: "wicket", how: null, who: "striker", runs: 0, f: "" };
+            render();
+          });
+        $("#undo") && ($("#undo").onclick = undo);
+        $("#second") && ($("#second").onclick = startSecond);
+        const goHome = () => {
+          view = "home";
+          T.cur = null;
+          H = [];
+          save();
+          render();
+          scrollTo(0, 0);
+        };
+        $("#back").onclick = goHome;
+        $("#home2") && ($("#home2").onclick = goHome);
+        $("#cfg").onclick = () => {
+          sheet = { k: "settings" };
+          render();
+        };
+        $("#del").onclick = () => {
+          if (arm("del")) {
+            T.matches.splice(T.cur, 1);
+            goHome();
+          }
+        };
+        bindInn(() => {
+          PUB.bbbOpen = true;
+          render();
+        });
+        $("#bbb").ontoggle = (e) => {
+          PUB.bbbOpen = e.target.open;
+        };
+      }
+
+      /* ================= admin sheets ================= */
+      function renderSheet() {
+        const el = $("#sheet");
+        el.innerHTML = "";
+        if (!T || mode !== "admin") return;
+        if (view === "home" && sheet && sheet.k === "newmatch")
+          return newMatchSheet(el);
+        if (view !== "match") return;
+        const m = M(),
+          I = m.innings[m.cur];
+        if (sheet && sheet.k === "settings") return settingsSheet(el, m, I);
+        if (sheet && sheet.k === "wicket") return wicketSheet(el, m, I);
+        if (!I.needs.length || I.ended || m.result) return;
+        const need = I.needs[0];
+        const wrap = (h) => {
+          el.innerHTML = `<div class="scrim"><form class="sheet" id="f">${h}</form></div>`;
+        };
+        if (need === "openers") {
+          const two = plOf(m, I.bat) >= 2;
+          const o1 = nextName(I.bat, []) || tn(I.bat) + " 1",
+            o2 = nextName(I.bat, [o1]) || tn(I.bat) + " 2",
+            b1 = nextName(I.bowl, []) || tn(I.bowl) + " 1";
+          wrap(`<span class="label">${esc(tn(I.bat))} batting · ${plOf(m, I.bat)} players</span><h2>Openers and first bowler</h2>
+      ${squadList("sqa", I.bat)}${squadList("sqb", I.bowl)}
+      <label class="field"><span class="label">On strike</span><input id="n1" list="sqa" value="${esc(o1)}"></label>
+      ${two ? `<label class="field"><span class="label">Non-striker</span><input id="n2" list="sqa" value="${esc(o2)}"></label>` : ""}
+      <label class="field"><span class="label">Bowler (${esc(tn(I.bowl))})</span><input id="n3" list="sqb" value="${esc(b1)}"></label>
+      <button class="btn">Play</button>`);
+          $("#f").onsubmit = (e) => {
+            e.preventDefault();
+            snap();
+            I.striker = addBatter(I, $("#n1").value.trim() || o1);
+            if (two) I.non = addBatter(I, $("#n2").value.trim() || o2);
+            setBowler(I, $("#n3").value.trim() || b1);
+            I.needs.shift();
+            save();
+            render();
+          };
+        } else if (need === "batter") {
+          const left = plOf(m, I.bat) - I.wkts;
+          const sug =
+            nextName(
+              I.bat,
+              I.batters.map((b) => b.name),
+            ) || tn(I.bat) + " " + (I.batters.length + 1);
+          const rest = (T.teams[I.bat].squad || []).filter(
+            (n) =>
+              !I.batters.some((b) => b.name.toLowerCase() === n.toLowerCase()),
+          );
+          wrap(`<span class="label">${I.runs}/${I.wkts} · ${left} player${s1(left)} left</span><h2>Next batter in</h2>
+      ${rest.length ? `<div class="chips-pick">${rest.map((n) => `<button type="button" data-n="${esc(n)}">${esc(n)}</button>`).join("")}</div>` : ""}
+      <label class="field"><span class="label">Name</span><input id="n1" value="${esc(sug)}"></label>
+      <button class="btn">Send in</button><button type="button" class="btn ghost" id="un">Undo last ball</button>`);
+          const go = (name) => {
+            const i = addBatter(I, name);
+            if (!okB(I, I.striker)) I.striker = i;
+            else I.non = i;
+            I.needs.shift();
+            save();
+            render();
+          };
+          el.querySelectorAll("[data-n]").forEach(
+            (b) => (b.onclick = () => go(b.dataset.n)),
+          );
+          $("#f").onsubmit = (e) => {
+            e.preventDefault();
+            go($("#n1").value.trim() || sug);
+          };
+          $("#un").onclick = undo;
+        } else {
+          const last = I.bowlers[I.bowler]?.name;
+          const pool = [
+            ...I.bowlers.map((b) => b.name),
+            ...(T.teams[I.bowl].squad || []),
+          ].filter(
+            (n, i, a) =>
+              n !== last &&
+              a.findIndex((x) => x.toLowerCase() === n.toLowerCase()) === i,
+          );
+          const sug =
+            nextName(
+              I.bowl,
+              I.bowlers.map((b) => b.name),
+            ) || tn(I.bowl) + " " + (I.bowlers.length + 1);
+          wrap(`<span class="label">End of over ${I.balls / 6} · ${I.runs}/${I.wkts}</span><h2>Who bowls next?</h2>
+      ${pool.length ? `<div class="chips-pick">${pool.map((n) => `<button type="button" data-n="${esc(n)}">${esc(n)}</button>`).join("")}</div>` : ""}
+      <label class="field"><span class="label">Or type a name</span><input id="n1" value="${esc(sug)}"></label>
+      <button class="btn">Bowl</button><button type="button" class="btn ghost" id="un">Undo last ball</button>`);
+          const go = (name) => {
+            setBowler(I, name);
+            I.needs.shift();
+            save();
+            render();
+          };
+          el.querySelectorAll("[data-n]").forEach(
+            (b) => (b.onclick = () => go(b.dataset.n)),
+          );
+          $("#f").onsubmit = (e) => {
+            e.preventDefault();
+            go($("#n1").value.trim() || sug);
+          };
+          $("#un").onclick = undo;
+        }
+      }
+      function wicketSheet(el, m, I) {
+        const s = sheet,
+          st = I.batters[I.striker],
+          nn = I.non >= 0 ? I.batters[I.non] : null,
+          bw = I.bowlers[I.bowler];
+        const fieldName = s.how && NEEDS_F[s.how];
+        el.innerHTML = `<div class="scrim"><form class="sheet" id="f"><span class="label">Wicket · ${esc(bw.name)} bowling</span><h2>How was the batter out?</h2>
+    <div class="howgrid">${HOW.map(([k, l]) => `<button type="button" data-how="${k}" aria-pressed="${s.how === k}">${l}</button>`).join("")}</div>
+    ${
+      s.how === "runout" && nn
+        ? `<div class="field"><span class="label">Who is out?</span><div class="seg">
+      <button type="button" id="wS" aria-pressed="${s.who === "striker"}">${esc(st.name)}</button><button type="button" id="wN" aria-pressed="${s.who === "non"}">${esc(nn.name)}</button></div></div>`
+        : ""
+    }
+    ${
+      s.how === "runout"
+        ? `<div class="field"><span class="label">Runs completed before the run out</span><div class="seg s4">
+      ${[0, 1, 2, 3].map((r) => `<button type="button" data-ro="${r}" aria-pressed="${s.runs === r}">${r}</button>`).join("")}</div></div>`
+        : ""
+    }
+    ${fieldName ? `${squadList("sqf", I.bowl)}<label class="field"><span class="label">${fieldName}</span><input id="fn" list="sqf" value="${esc(s.f)}" placeholder="Fielder name"></label>` : ""}
+    ${s.how ? `<button class="btn" style="background:var(--ball);color:var(--ball-ink)">Confirm ${esc(HOW.find((h) => h[0] === s.how)[1].toLowerCase())}</button>` : ""}
+    <button type="button" class="link" id="wc" style="align-self:center">Cancel</button></form></div>`;
+        const keep = () => {
+          const f = $("#fn");
+          if (f) s.f = f.value;
+        };
+        el.querySelectorAll("[data-how]").forEach(
+          (b) =>
+            (b.onclick = () => {
+              keep();
+              s.how = b.dataset.how;
+              if (s.how !== "runout") {
+                s.who = "striker";
+                s.runs = 0;
+              }
+              render();
+            }),
+        );
+        el.querySelectorAll("[data-ro]").forEach(
+          (b) =>
+            (b.onclick = () => {
+              keep();
+              s.runs = +b.dataset.ro;
+              render();
+            }),
+        );
+        $("#wS") &&
+          ($("#wS").onclick = () => {
+            keep();
+            s.who = "striker";
+            render();
+          });
+        $("#wN") &&
+          ($("#wN").onclick = () => {
+            keep();
+            s.who = "non";
+            render();
+          });
+        $("#wc").onclick = () => {
+          sheet = null;
+          render();
+        };
+        $("#f").onsubmit = (e) => {
+          e.preventDefault();
+          if (!s.how) return;
+          keep();
+          wicket(s.how, s.who, (s.f || "").trim(), s.runs);
+        };
+      }
+      function settingsSheet(el, m, I) {
+        if (sheet.lm === undefined) sheet.lm = m.lastMan;
+        el.innerHTML = `<div class="scrim"><form class="sheet" id="f"><span class="label">Match ${T.cur + 1} · change anytime</span><h2>Overs &amp; players</h2>
+    <label class="field"><span class="label">Overs per innings</span><input id="so" type="number" inputmode="numeric" min="1" max="50" value="${sheet.ov ?? m.overs}"></label>
+    <div class="grid2">${m.t.map((t, k) => `<label class="field"><span class="label">${esc(tn(t))} players</span><input id="sp${k}" type="number" inputmode="numeric" min="2" max="15" value="${sheet["p" + k] ?? m.players[k]}"></label>`).join("")}</div>
+    <div class="field"><span class="label">Last man stands</span>
+      <div class="seg"><button type="button" id="lmY" aria-pressed="${sheet.lm}">Can bat alone</button><button type="button" id="lmN" aria-pressed="${!sheet.lm}">Off</button></div></div>
+    <p class="note">Changes apply to this match only. Adding overs or players can reopen a finished innings.</p>
+    <button class="btn">Save</button><button type="button" class="link" id="sc" style="align-self:center">Cancel</button></form></div>`;
+        const keep = () => {
+          sheet.ov = $("#so").value;
+          sheet.p0 = $("#sp0").value;
+          sheet.p1 = $("#sp1").value;
+        };
+        $("#lmY").onclick = () => {
+          keep();
+          sheet.lm = true;
+          render();
+        };
+        $("#lmN").onclick = () => {
+          keep();
+          sheet.lm = false;
+          render();
+        };
+        $("#sc").onclick = () => {
+          sheet = null;
+          render();
+        };
+        $("#f").onsubmit = (e) => {
+          e.preventDefault();
+          snap();
+          m.overs = clamp($("#so").value, 1, 50, m.overs);
+          m.players = [
+            clamp($("#sp0").value, 2, 15, m.players[0]),
+            clamp($("#sp1").value, 2, 15, m.players[1]),
+          ];
+          m.lastMan = sheet.lm;
+          sheet = null;
+          reeval(m);
+          save();
+          render();
+        };
+      }
+      function newMatchSheet(el) {
+        const played = T.teams.map(
+          (_, i) => T.matches.filter((m) => m.t.includes(i)).length,
+        );
+        if (sheet.a === undefined) {
+          const ord = T.teams
+            .map((_, i) => i)
+            .sort((x, y) => played[x] - played[y]);
+          sheet.a = ord[0];
+          sheet.b = ord[1];
+          sheet.first = 0;
+          sheet.lm = T.lastMan;
+          sheet.ov = T.overs;
+          sheet.pa = T.teams[sheet.a].players;
+          sheet.pb = T.teams[sheet.b].players;
+        }
+        const opts = (sel) =>
+          T.teams
+            .map(
+              (t, i) =>
+                `<option value="${i}" ${i === sel ? "selected" : ""}>${esc(t.name)}</option>`,
+            )
+            .join("");
+        const same = sheet.a === sheet.b;
+        el.innerHTML = `<div class="scrim"><form class="sheet" id="f"><span class="label">Match ${T.matches.length + 1}</span><h2>New match</h2>
+    <div class="grid2"><label class="field"><span class="label">Team 1</span><select id="ma">${opts(sheet.a)}</select></label>
+      <label class="field"><span class="label">Team 2</span><select id="mb">${opts(sheet.b)}</select></label></div>
+    <div class="grid2"><label class="field"><span class="label">${esc(tn(sheet.a))} players</span><input id="pa" type="number" inputmode="numeric" min="2" max="15" value="${sheet.pa}"></label>
+      <label class="field"><span class="label">${esc(tn(sheet.b))} players</span><input id="pb" type="number" inputmode="numeric" min="2" max="15" value="${sheet.pb}"></label></div>
+    <label class="field"><span class="label">Overs per innings</span><input id="mo" type="number" inputmode="numeric" min="1" max="50" value="${sheet.ov}"></label>
+    <div class="field"><span class="label">Who bats first?</span>
+      <div class="seg"><button type="button" id="f0" aria-pressed="${sheet.first === 0}">${esc(tn(sheet.a))}</button><button type="button" id="f1" aria-pressed="${sheet.first === 1}">${esc(tn(sheet.b))}</button></div></div>
+    <div class="field"><span class="label">Last man stands</span>
+      <div class="seg"><button type="button" id="lmY" aria-pressed="${sheet.lm}">Can bat alone</button><button type="button" id="lmN" aria-pressed="${!sheet.lm}">Off</button></div></div>
+    ${same ? '<p class="hint">Pick two different teams.</p>' : ""}
+    <button class="btn" ${same ? "disabled" : ""}>Start match</button><button type="button" class="link" id="mc" style="align-self:center">Cancel</button></form></div>`;
+        const keep = () => {
+          sheet.pa = $("#pa").value;
+          sheet.pb = $("#pb").value;
+          sheet.ov = $("#mo").value;
+        };
+        $("#ma").onchange = () => {
+          keep();
+          sheet.a = +$("#ma").value;
+          sheet.pa = T.teams[sheet.a].players;
+          render();
+        };
+        $("#mb").onchange = () => {
+          keep();
+          sheet.b = +$("#mb").value;
+          sheet.pb = T.teams[sheet.b].players;
+          render();
+        };
+        $("#f0").onclick = () => {
+          keep();
+          sheet.first = 0;
+          render();
+        };
+        $("#f1").onclick = () => {
+          keep();
+          sheet.first = 1;
+          render();
+        };
+        $("#lmY").onclick = () => {
+          keep();
+          sheet.lm = true;
+          render();
+        };
+        $("#lmN").onclick = () => {
+          keep();
+          sheet.lm = false;
+          render();
+        };
+        $("#mc").onclick = () => {
+          sheet = null;
+          render();
+        };
+        $("#f").onsubmit = (e) => {
+          e.preventDefault();
+          if (same) return;
+          const t = [sheet.a, sheet.b],
+            bat = t[sheet.first],
+            bowl = t[1 - sheet.first];
+          T.matches.push({
+            t,
+            overs: clamp($("#mo").value, 1, 50, T.overs),
+            players: [
+              clamp($("#pa").value, 2, 15, 6),
+              clamp($("#pb").value, 2, 15, 6),
+            ],
+            lastMan: sheet.lm,
+            innings: [newInn(bat, bowl)],
+            cur: 0,
+            result: null,
+            winner: null,
+            start: Date.now(),
+          });
+          T.cur = T.matches.length - 1;
+          H = [];
+          sheet = null;
+          view = "match";
+          mod = null;
+          save();
+          render();
+          scrollTo(0, 0);
+        };
+      }
+
+      /* ================= admin login + boot ================= */
+      function renderLogin(msg) {
+        mode = "admin";
+        $("#sheet").innerHTML = "";
+        $("#app").className = "wrap";
+        $("#app").innerHTML =
+          `<div class="center" style="display:flex;flex-direction:column;gap:14px">
+    <span class="label">Organiser</span><h1>Admin login</h1>
+    <form class="panel" id="lf"><label class="field"><span class="label">Password</span><input id="pw" type="password" autocomplete="current-password"></label>
+      <button class="btn">Log in</button>${msg ? `<p class="hint">${esc(msg)}</p>` : ""}</form>
+    <a class="link" href="/">View live scores instead</a></div>`;
+        $("#pw").focus();
+        $("#lf").onsubmit = async (e) => {
+          e.preventDefault();
+          const r = await api("login", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ password: $("#pw").value }),
+          }).catch(() => ({ status: 0 }));
+          if (r.ok && r.j.token) {
+            token = r.j.token;
+            lset(TKEY, token);
+            adminBoot();
+          } else
+            renderLogin(
+              r.status === 401
+                ? "That password is not right."
+                : r.status === 503
+                  ? "No admin password is set. Add ADMIN_PASSWORD in the Vercel project settings, then redeploy."
+                  : "Could not reach the server. Check your connection and try again.",
+            );
+        };
+      }
+      function loadLocal() {
+        T = null;
+        H = [];
+        try {
+          const d = JSON.parse(lget(LKEY));
+          if (d && d.T) {
+            T = d.T;
+            H = d.H || [];
+          }
+        } catch (e) {}
+        if (!T) {
+          try {
+            const d = JSON.parse(lget(OLDKEY));
+            if (d && d.T) {
+              T = d.T;
+            }
+          } catch (e) {}
+        }
+        if (T) {
+          T.id = T.id || rid();
+          T.teams.forEach((t) => (t.squad = t.squad || []));
+          view = T.cur != null ? "match" : "home";
+        }
+      }
+      async function adminBoot() {
+        mode = "admin";
+        loadLocal();
+        token = lget(TKEY);
+        if (cloud === "on" && !token) return renderLogin();
+        if (cloud === "on") {
+          $("#app").innerHTML = '<p class="note">Loading your tournaments…</p>';
+          const idx = await api("state?fresh=" + Date.now()).catch(() => null);
+          if (idx && idx.ok) INDEX = idx.j;
+          if (T) {
+            const s = await api(
+              "state?t=" + T.id + "&fresh=" + Date.now(),
+            ).catch(() => null);
+            if (
+              s &&
+              s.ok &&
+              s.j.data &&
+              (s.j.data.T.updated || 0) > (T.updated || 0)
+            ) {
+              T = s.j.data.T;
+              H = [];
+              saveLocalOnly();
+              view = T.cur != null ? "match" : "home";
+            } else schedulePush(0);
+          } else if (INDEX && INDEX.latest) {
+            const s = await api(
+              "state?t=" + INDEX.latest + "&fresh=" + Date.now(),
+            ).catch(() => null);
+            if (s && s.ok) {
+              T = s.j.data.T;
+              T.id = INDEX.latest;
+              H = [];
+              saveLocalOnly();
+              view = T.cur != null ? "match" : "home";
+            }
+          }
+        }
+        D = null;
+        if (!T) openSetup(true);
+        else render();
+      }
+      function renderAdmin() {
+        document.body.className = "";
+        if (!T || view === "setup") {
+          if (!D) openSetup(true);
+          else renderSetup();
+        } else if (view === "match" && T.cur != null && M()) renderMatch();
+        else {
+          view = "home";
+          renderHome();
+        }
+        renderSheet();
+      }
+
+      /* ================= public live site ================= */
+      function mrow(m, team, I) {
+        const live = !m.result && I && m.innings[m.cur] === I && !I.ended;
+        return `<div class="mrow ${live ? "bat" : ""}"><span class="tm">${esc(tn(team))}</span>${I && (I.balls || I.runs || I.batters.length) ? `<span class="sc">${I.runs}/${I.wkts}<small>${ov(I.balls)} ov</small></span>` : '<span class="yet">Yet to bat</span>'}</div>`;
+      }
+      const innOf = (m, team) => m.innings.find((I) => I.bat === team);
+      function renderPublicHome() {
+        $("#app").className = "wrap wide";
+        if (!T) {
+          $("#app").innerHTML =
+            `<div class="center" style="display:flex;flex-direction:column;gap:12px"><span class="label">Live scores</span><h1>No games yet</h1><p class="note">Scores will appear here as soon as the organiser starts a tournament.</p></div>`;
+          return;
+        }
+        const list = (INDEX && INDEX.index) || [];
+        const live = T.matches
+          .map((m, i) => ({ m, i }))
+          .filter((x) => !x.m.result);
+        const card = ({ m, i }) => {
+          const s = matchStatus(m);
+          return `<a class="fxi" href="#match-${i + 1}">
+    <span class="row"><span class="label">Match ${i + 1}</span>${s.live ? '<span class="tag live">Live</span>' : ""}</span>
+    <div class="sum">${m.t.map((t) => mrow(m, t, innOf(m, t))).join("")}</div>
+    <span class="status ${s.live ? "live" : ""}">${esc(s.t)}</span></a>`;
+        };
+        const tab = PUB.tab;
+        $("#app").innerHTML = `
+  <div class="topbar"><span class="label">Live scores · ${T.overs} overs a side</span>
+    ${list.length > 1 ? `<select id="tsel" aria-label="Tournament" style="width:auto">${list.map((x) => `<option value="${esc(x.id)}" ${x.id === PUB.tid ? "selected" : ""}>${esc(x.name)}</option>`).join("")}</select>` : ""}</div>
+  <h1>${esc(T.name)}</h1>
+  ${T.finished ? `<div class="panel"><span class="label">Final</span>${awardsHTML(collect(T.matches), true, standings()[0])}</div>` : ""}
+  ${live
+    .map((x) => {
+      const s = matchStatus(x.m);
+      return `<a class="livecard" href="#match-${x.i + 1}">
+    <span class="row"><span class="label" style="color:inherit;opacity:.75">Match ${x.i + 1} · ${x.m.overs} overs</span><span class="tag live">Live</span></span>
+    ${x.m.t
+      .map((t) => {
+        const I = innOf(x.m, t);
+        return `<span class="row"><span class="tm ${I ? "" : "dim"}">${esc(tn(t))}</span>${I && (I.balls || I.batters.length) ? `<span class="sc">${I.runs}/${I.wkts}<small>${ov(I.balls)}</small></span>` : '<span class="dim">Yet to bat</span>'}</span>`;
+      })
+      .join("")}
+    <span class="st">${esc(s.t)}</span><span class="st" style="opacity:.7">Tap for ball by ball →</span></a>`;
+    })
+    .join("")}
+  <div class="tabs" role="tablist">${[
+    ["matches", "Matches"],
+    ["table", "Points table"],
+    ["stats", "Stats"],
+  ]
+    .map(
+      ([k, l]) =>
+        `<button role="tab" data-tab="${k}" aria-selected="${tab === k}">${l}</button>`,
+    )
+    .join("")}</div>
+  ${
+    tab === "matches"
+      ? `<div class="fx">${
+          T.matches.length
+            ? T.matches
+                .map((m, i) => ({ m, i }))
+                .reverse()
+                .map(card)
+                .join("")
+            : '<p class="note">No matches yet.</p>'
+        }</div>`
+      : ""
+  }
+  ${tab === "table" ? `<div class="panel">${tableHTML()}</div>` : ""}
+  ${tab === "stats" ? `<div class="panel"><h2>Tournament leaders</h2>${leadersHTML(10)}</div>` : ""}
+  <p class="note">Updates automatically.${cloud !== "on" ? ' <button class="link" id="toAdmin">Back to scoring</button>' : ""}</p>`;
+        document.querySelectorAll("[data-tab]").forEach(
+          (b) =>
+            (b.onclick = () => {
+              PUB.tab = b.dataset.tab;
+              renderPublic();
+            }),
+        );
+        $("#tsel") &&
+          ($("#tsel").onchange = () => {
+            PUB.tid = $("#tsel").value;
+            PUB.pinned = true;
+            PUB.updated = -1;
+            try {
+              history.replaceState(null, "", "?t=" + PUB.tid);
+            } catch (e) {}
+            pubTick();
+          });
+        $("#toAdmin") &&
+          ($("#toAdmin").onclick = () => {
+            location.hash = "admin";
+          });
+      }
+      function renderCentre(i) {
+        const m = T && T.matches[i];
+        if (!m) {
+          location.hash = "live";
+          return;
+        }
+        $("#app").className = "wrap wide";
+        const I = m.innings[m.cur],
+          s = matchStatus(m);
+        const inPlay = !m.result && !I.ended && I.batters.length;
+        const bw = I.bowlers[I.bowler],
+          cur = I.overs[I.overs.length - 1];
+        const batRow = (k) => {
+          const b = I.batters[k];
+          return b
+            ? `<tr><td class="${k === I.striker ? "strike" : ""}">${esc(b.name)}</td><td><b>${b.r}</b></td><td>${b.b}</td><td>${b.f4}</td><td>${b.s6}</td><td>${sr(b.r, b.b)}</td></tr>`
+            : "";
+        };
+        const lastOut = [...I.batters].reverse().find((b) => b.out);
+        const tab = PUB.mtab;
+        $("#app").innerHTML = `
+  <div class="topbar"><a class="link" href="#live">← ${esc(T.name)}</a>${s.live ? '<span class="tag live">Live</span>' : '<span class="tag">Result</span>'}</div>
+  <h1>${esc(tn(m.t[0]))} v ${esc(tn(m.t[1]))}</h1>
+  <div class="cols"><div class="col stick">
+    <div class="panel"><span class="label">Match ${i + 1} · ${m.overs} overs · ${m.lastMan ? "last man can bat alone" : "last man off"}</span>
+      <div class="sum">${m.innings.map((x) => mrow(m, x.bat, x)).join("")}${m.innings.length < 2 ? mrow(m, m.innings[0].bowl, null) : ""}</div>
+      <span class="status ${s.live ? "live" : ""}">${esc(s.t)}</span>
+      ${m.cur === 1 && !m.result ? `<p class="note">Run rate ${I.balls ? ((I.runs * 6) / I.balls).toFixed(2) : "0.00"} · Required ${m.overs * 6 - I.balls ? (((target(m) - I.runs) * 6) / (m.overs * 6 - I.balls)).toFixed(2) : "–"}</p>` : ""}
+    </div>
+    ${m.result ? `<div class="panel"><span class="label">Player awards</span>${awardsHTML(collect([m]), false)}</div>` : ""}
+    ${
+      inPlay
+        ? `<div class="panel">
+      ${I.non === -1 ? '<span><span class="tag alone">Last man batting alone</span></span>' : ""}
+      <div class="tw"><table class="ptable"><tr><th>Batter</th><th>R</th><th>B</th><th>4s</th><th>6s</th><th>SR</th></tr>${batRow(I.striker)}${batRow(I.non)}</table></div>
+      ${bw ? `<div class="tw"><table class="ptable"><tr><th>Bowler</th><th>O</th><th>R</th><th>W</th><th>Econ</th></tr><tr><td>${esc(bw.name)}</td><td>${ov(bw.balls)}</td><td>${bw.r}</td><td><b>${bw.w}</b></td><td>${econ(bw.r, bw.balls)}</td></tr></table></div>` : ""}
+      <div><span class="label">This over</span><div class="over">${cur && cur.balls.length ? chips(cur) : '<span class="note">New over</span>'}</div></div>
+      ${lastOut ? `<p class="note">Last wicket: ${esc(lastOut.name)} ${esc(howText(lastOut))} ${lastOut.r} (${lastOut.b})</p>` : ""}
+    </div>`
+        : ""
+    }
+  </div><div class="col">
+    <div class="tabs" role="tablist">${[
+      ["com", "Ball by ball"],
+      ["card", "Scorecard"],
+    ]
+      .map(
+        ([k, l]) =>
+          `<button role="tab" data-mtab="${k}" aria-selected="${tab === k}">${l}</button>`,
+      )
+      .join("")}</div>
+    ${innPicker(m)}
+    ${tab === "com" ? commentaryHTML(m, innSel(m)) : cardHTML(m, m.innings[innSel(m)], true)}
+  </div></div>`;
+        document.querySelectorAll("[data-mtab]").forEach(
+          (b) =>
+            (b.onclick = () => {
+              PUB.mtab = b.dataset.mtab;
+              renderPublic();
+            }),
+        );
+        bindInn(renderPublic);
+      }
+      function renderPublic() {
+        document.body.className = "";
+        $("#sheet").innerHTML = "";
+        const h = location.hash.match(/^#match-(\d+)$/);
+        if (h && T) renderCentre(+h[1] - 1);
+        else renderPublicHome();
+      }
+      async function pullRemote() {
+        // follows ?t=… or the most recently updated tournament
+        if (!PUB.tid || (!qs.get("t") && !PUB.pinned)) {
+          const r = await api("state").catch(() => null);
+          if (r && r.ok) {
+            INDEX = r.j;
+            if (!PUB.pinned) PUB.tid = qs.get("t") || INDEX.latest;
+          }
+        }
+        if (!PUB.tid) return false;
+        const s = await api("state?t=" + PUB.tid).catch(() => null);
+        if (s && s.ok && s.j.updated !== PUB.updated) {
+          PUB.updated = s.j.updated;
+          T = s.j.data.T;
+          return true;
+        }
+        return false;
+      }
+      function pullLocal() {
+        const raw = lget(LKEY);
+        if (raw === PUB.updated) return false;
+        PUB.updated = raw;
+        try {
+          T = raw ? JSON.parse(raw).T : null;
+        } catch (e) {
+          T = null;
+        }
+        return true;
+      }
+      async function pubTick() {
+        if (cloud === "on") {
+          if (await pullRemote()) render();
+        } else if (pullLocal()) render();
+      }
+      function pubBoot() {
+        mode = "public";
+        PUB.updated = -1;
+        PUB.tid = qs.get("t") || null;
+        PUB.pinned = !!qs.get("t");
+        T = null;
+        $("#app").innerHTML = '<p class="note">Loading scores…</p>';
+        pubTick().then(() => {
+          if (!T) render();
+        });
+        PUB.timer = setInterval(pubTick, cloud === "on" ? 4000 : 1200);
+      }
+
+      /* ================= big screen ================= */
+      function tvRender() {
+        document.body.className = "tv";
+        const app = $("#app");
+        app.className = "wrap";
+        const back =
+          cloud === "on"
+            ? ""
+            : `<button class="tvback" id="tvb">Back to scoring</button>`;
+        if (!T) {
+          app.innerHTML = `<div class="tvbox" style="margin:auto;text-align:center"><div class="tvbig">Waiting for scores</div><p class="tvaw"><span>Scores show here as soon as the organiser starts scoring.</span></p></div>${back}`;
+          bindTvBack();
+          return;
+        }
+        const st = standings(),
+          tour = collect(T.matches);
+        const m =
+          T.cur != null && T.matches[T.cur]
+            ? T.matches[T.cur]
+            : T.matches.find((x) => !x.result) ||
+              T.matches[T.matches.length - 1];
+        const head = `<div class="tvhead"><span><b>${esc(T.name)}</b>${m ? ` · Match ${T.matches.indexOf(m) + 1} · ${esc(tn(m.t[0]))} v ${esc(tn(m.t[1]))}` : ""}</span><span>${m ? m.overs + " overs" : ""}</span></div>`;
+        const table = `<div class="tvbox"><span class="tvlbl">Points table</span><table class="tvtable"><tr><th>Team</th><th>P</th><th>W</th><th>L</th><th>Pts</th><th>NRR</th></tr>
+    ${st.map((r) => `<tr><td>${esc(r.name)}</td><td>${r.p}</td><td>${r.w}</td><td>${r.l}</td><td><b>${r.pts}</b></td><td>${nrrTxt(r)}</td></tr>`).join("")}</table></div>`;
+        const aw = (s, tour, champ) => {
+          const a = s.B[0],
+            w = s.W[0];
+          return `<div class="tvgrid">
+    ${champ ? `<div class="tvbox tvaw"><span class="tvlbl">Champions</span><b>${esc(tn(champ.i))}</b><span>${champ.pts} points</span></div>` : ""}
+    ${a ? `<div class="tvbox tvaw"><span class="tvlbl">${tour ? "Top run scorer" : "Top scorer"}</span><b>${esc(a.name)}</b><span>${esc(tn(a.team))} · ${batLine(a, tour)}</span></div>` : ""}
+    ${w ? `<div class="tvbox tvaw"><span class="tvlbl">Best bowler</span><b>${esc(w.name)}</b><span>${esc(tn(w.team))} · ${bowlLine(w, tour)}</span></div>` : ""}</div>`;
+        };
+        let body = "";
+        if (T.finished)
+          body = `<div class="tvbig">${esc(T.name)} winners</div>${aw(tour, true, st[0])}${table}`;
+        else if (!m) body = table;
+        else if (m.result) {
+          const a = m.innings[0],
+            b = m.innings[1];
+          body = `<div class="tvbox"><span class="tvlbl">Result</span><div class="tvbig">${esc(m.result)}</div>
+      <div class="tvsub"><span><b>${esc(tn(a.bat))}</b> ${a.runs}/${a.wkts} (${ov(a.balls)})</span><span><b>${esc(tn(b.bat))}</b> ${b.runs}/${b.wkts} (${ov(b.balls)})</span></div></div>
+      ${aw(collect([m]), false)}${table}`;
+        } else {
+          const I = m.innings[m.cur];
+          if (I.ended && m.cur === 0) {
+            body = `<div class="tvbox"><span class="tvlbl">Innings break</span><div class="tvbig">${esc(tn(I.bowl))} need ${target(m)}</div>
+        <div class="tvsub"><span><b>${esc(tn(I.bat))}</b> ${I.runs}/${I.wkts} (${ov(I.balls)})</span><span>${m.overs} overs to chase</span></div></div>
+        ${aw(collect([{ innings: [I] }]), false)}`;
+          } else {
+            const crr = I.balls ? ((I.runs * 6) / I.balls).toFixed(2) : "0.00";
+            const eq =
+              m.cur === 1
+                ? (() => {
+                    const need = target(m) - I.runs,
+                      left = m.overs * 6 - I.balls;
+                    return `<div class="tveq">Need ${need} off ${left} ball${s1(left)} · RRR ${left ? ((need * 6) / left).toFixed(2) : "–"}</div>`;
+                  })()
+                : "";
+            const brow = (k) => {
+              const b = I.batters[k];
+              return b
+                ? `<div class="tvrow"><span class="n ${k === I.striker ? "on" : ""}">${esc(b.name)}</span><span class="r">${b.r}</span><span class="b">(${b.b})</span></div>`
+                : "";
+            };
+            const bw = I.bowlers[I.bowler],
+              cur = I.overs[I.overs.length - 1];
+            const lastBall =
+              cur && cur.balls.length ? cur.balls[cur.balls.length - 1] : null;
+            const lastOut = [...I.batters].reverse().find((b) => b.out);
+            body = `<div class="tvmain">
+        <div class="tvbox"><span class="tvteam">${esc(tn(I.bat))}</span>
+          <div class="tvruns">${I.runs}<span>/${I.wkts}</span></div>
+          <div class="tvsub"><span>Overs <b>${ov(I.balls)}</b> of ${m.overs}</span><span>Run rate <b>${crr}</b></span>${m.cur === 1 ? `<span>Target <b>${target(m)}</b></span>` : ""}</div>
+          ${eq}</div>
+        <div class="tvbox"><span class="tvlbl">Batting${I.non === -1 && I.batters.length ? " · last man alone" : ""}</span>${brow(I.striker)}${brow(I.non)}
+          ${bw ? `<span class="tvlbl" style="margin-top:1.5vmin">Bowling</span><div class="tvrow"><span class="n">${esc(bw.name)}</span><span class="r">${bw.w}-${bw.r}</span><span class="b">(${ov(bw.balls)})</span></div>` : ""}
+        </div></div>
+      <div class="tvbox"><span class="tvlbl">This over${lastBall && lastBall.bat ? " · " + ballText(lastBall).replace(/<[^>]+>/g, "") : ""}</span><div class="tvover">${cur && cur.balls.length ? chips(cur) : '<span class="tvsub">New over</span>'}</div></div>
+      <div class="tvfoot"><span>${m.cur === 1 ? `${esc(tn(m.innings[0].bat))} ${m.innings[0].runs}/${m.innings[0].wkts} (${ov(m.innings[0].balls)})` : `${maxW(m, I) - I.wkts} wicket${s1(maxW(m, I) - I.wkts)} in hand`}</span>
+        <span>${lastOut ? `Last out: ${esc(lastOut.name)} ${lastOut.r} · ${esc(howText(lastOut))}` : ""}</span></div>`;
+          }
+        }
+        app.innerHTML = head + body + back;
+        bindTvBack();
+      }
+      function bindTvBack() {
+        const b = $("#tvb");
+        if (b)
+          b.onclick = () => {
+            location.hash = "admin";
+          };
+      }
+      function startTV() {
+        mode = "tv";
+        PUB.updated = -1;
+        PUB.tid = qs.get("t") || null;
+        PUB.pinned = !!qs.get("t");
+        T = null;
+        tvRender();
+        pubTick();
+        PUB.timer = setInterval(pubTick, cloud === "on" ? 3000 : 1000);
+        const lock = () => {
+          try {
+            navigator.wakeLock &&
+              navigator.wakeLock.request("screen").catch(() => {});
+          } catch (e) {}
+        };
+        lock();
+        document.addEventListener("visibilitychange", () => {
+          if (!document.hidden && mode === "tv") lock();
+        });
+      }
+
+      /* ================= routing ================= */
+      function route() {
+        const h = location.hash.slice(1),
+          p = location.pathname.replace(/\/+$/, "");
+        if (h === "admin") return "admin";
+        if (h === "tv" || h === "display" || qs.get("view") === "display")
+          return "tv";
+        if (h === "live" || /^match-\d+$/.test(h)) return "public";
+        if (p.endsWith("/admin")) return "admin";
+        if (p.endsWith("/tv")) return "tv";
+        return cloud === "on" ? "public" : "admin";
+      }
+      function render() {
+        if (mode === "admin") return renderAdmin();
+        if (mode === "tv") return tvRender();
+        return renderPublic();
+      }
+      function boot() {
+        clearInterval(PUB.timer);
+        sheet = null;
+        $("#sheet").innerHTML = "";
+        const r = route();
+        if (r === "admin") return adminBoot();
+        if (r === "tv") return startTV();
+        return pubBoot();
+      }
+      window.addEventListener("hashchange", () => {
+        PUB.inn = null;
+        const r = route();
+        if (r !== mode) boot();
+        else if (mode === "public") {
+          scrollTo(0, 0);
+          renderPublic();
+        }
+      });
+      window.addEventListener("storage", (e) => {
+        if (e.key === LKEY && mode !== "admin" && cloud !== "on") pubTick();
+      });
+      window.addEventListener("online", () => {
+        if (mode === "admin") schedulePush(0);
+      });
+      try {
+        navigator.storage &&
+          navigator.storage.persist &&
+          navigator.storage.persist().catch(() => {});
+      } catch (e) {}
+      (async () => {
+        $("#app").innerHTML = '<p class="note">Loading…</p>';
+        await detect();
+        boot();
+      })();
+    </script>
+  </body>
+</html>
