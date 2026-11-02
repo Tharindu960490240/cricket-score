@@ -2007,7 +2007,7 @@
             const lastOut = [...I.batters].reverse().find((b) => b.out);
             body = `<div class="tvmain">
         <div class="tvbox"><span class="tvteam">${esc(tn(I.bat))}</span>
-          <div class="tvruns">${I.runs}<span>/${I.wkts}</span></div>
+          <div class="tvruns"><span>${I.runs}</span><span>/${I.wkts}</span></div>
           <div class="tvsub"><span>Overs <b>${ov(I.balls)}</b> of ${m.overs}</span><span>Run rate <b>${crr}</b></span>${m.cur === 1 ? `<span>Target <b>${target(m)}</b></span>` : ""}</div>
           ${eq}</div>
         <div class="tvbox"><span class="tvlbl">Batting${I.non === -1 && I.batters.length ? " · last man alone" : ""}</span>${brow(I.striker)}${brow(I.non)}
