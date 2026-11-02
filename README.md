@@ -1,4 +1,4 @@
-# Backyard Cricket Scorer
+# Cricket Scorer
 
 Live cricket scoring for friendly tournaments.
 
