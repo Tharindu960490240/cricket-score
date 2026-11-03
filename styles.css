@@ -596,6 +596,7 @@ details.plain summary {
   font-size: 13px;
   font-variant-numeric: tabular-nums;
   opacity: 0.9;
+  margin-top: 10px;
 }
 .stats b {
   font-weight: 700;
@@ -941,6 +942,7 @@ body.tv .wrap {
   font-weight: 500;
   color: var(--tv-dim);
   font-variant-numeric: tabular-nums;
+  margin-top: 5vmin;
 }
 .tvsub b {
   color: var(--tv-ink);
